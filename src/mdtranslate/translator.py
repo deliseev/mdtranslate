@@ -703,11 +703,18 @@ class Clock(Protocol):
 
 
 class SubprocessGit:
-    """GitClient поверх настоящего git."""
+    """GitClient поверх настоящего git.
+
+    `root` позволяет работать с репозиторием, лежащим не в текущем каталоге, —
+    иначе инструмент можно было бы запускать только изнутри целевого репозитория.
+    """
+
+    def __init__(self, root: str = ".") -> None:
+        self.root = root
 
     def _run(self, *args: str, quiet: bool = False) -> str:
         return subprocess.check_output(
-            ["git", *args],
+            ["git", "-C", self.root, *args],
             text=True,
             timeout=GIT_TIMEOUT_SECONDS,
             stderr=subprocess.DEVNULL if quiet else None,
@@ -769,27 +776,46 @@ class SubprocessGit:
 
 
 class RealFileSystem:
-    """FileSystem поверх настоящего диска."""
+    """FileSystem поверх настоящего диска.
+
+    Все пути из конфига относительны корню репозитория, а не текущему каталогу:
+    иначе инструмент работал бы только при запуске изнутри этого репозитория.
+    """
+
+    def __init__(self, root: str = ".") -> None:
+        self.root = root
+
+    def resolve(self, path: str) -> str:
+        """Путь из конфига — в путь на диске.
+
+        При корне по умолчанию путь не трогаем вовсе: так поведение без --repo
+        остаётся ровно прежним, без ведущего «./».
+        """
+        if os.path.isabs(path) or self.root == ".":
+            return path
+        return os.path.join(self.root, path)
 
     def read(self, path: str) -> str:
         """Читает файл целиком."""
-        with open(path, encoding="utf-8") as handle:
+        with open(self.resolve(path), encoding="utf-8") as handle:
             return handle.read()
 
     def write(self, path: str, text: str) -> None:
         """Записывает файл, создавая недостающие каталоги."""
-        directory = os.path.dirname(path)
+        full = self.resolve(path)
+        directory = os.path.dirname(full)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
+        with open(full, "w", encoding="utf-8") as handle:
             handle.write(text)
 
     def exists(self, path: str) -> bool:
         """Существует ли файл."""
-        return os.path.exists(path)
+        return os.path.exists(self.resolve(path))
 
     def remove(self, path: str) -> None:
         """Удаляет файл, если он есть."""
+        path = self.resolve(path)
         if os.path.exists(path):
             os.remove(path)
 
@@ -867,11 +893,18 @@ class ReadOnlyFileSystem:
 
 
 class GhPullRequests:
-    """PullRequestClient поверх GitHub CLI."""
+    """PullRequestClient поверх GitHub CLI.
+
+    `gh` определяет репозиторий по текущему каталогу, поэтому его нужно запускать
+    внутри целевого — своего ключа для корня у него нет.
+    """
+
+    def __init__(self, root: str = ".") -> None:
+        self.root = root
 
     def _run(self, *args: str) -> str:
         return subprocess.check_output(
-            ["gh", *args], text=True, timeout=GIT_TIMEOUT_SECONDS
+            ["gh", *args], text=True, timeout=GIT_TIMEOUT_SECONDS, cwd=self.root
         )
 
     def create_draft(
@@ -929,6 +962,7 @@ class GhPullRequests:
                 timeout=GIT_TIMEOUT_SECONDS,
                 check=True,
                 stdout=subprocess.DEVNULL,
+                cwd=self.root,
             )
         except Exception as exc:  # noqa: BLE001
             # Ревью — вспомогательная штука: перевод уже закоммичен, и терять
@@ -1499,6 +1533,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="путь к TOML-конфигу",
     )
     parser.add_argument(
+        "--repo",
+        default=".",
+        help="корень репозитория с документацией (по умолчанию текущий каталог)",
+    )
+    parser.add_argument(
         "--no-llm",
         action="store_true",
         help="не обращаться к модели: печатать промпт вместо запроса. "
@@ -1521,9 +1560,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     no_llm = args.no_llm or args.dry_run
     no_remote = args.no_remote or args.dry_run
 
-    config = load_config(args.config)
-    file_system: FileSystem = RealFileSystem()
-    git: GitClient = SubprocessGit()
+    if not os.path.isdir(os.path.join(args.repo, ".git")):
+        parser.error(f"{args.repo} не похож на корень git-репозитория")
+
+    # Конфиг живёт в самом репозитории, поэтому относительный путь считается от
+    # его корня, а не от каталога, из которого запустили команду.
+    config_path = (
+        args.config
+        if os.path.isabs(args.config)
+        else os.path.join(args.repo, args.config)
+    )
+    config = load_config(config_path)
+    file_system: FileSystem = RealFileSystem(args.repo)
+    git: GitClient = SubprocessGit(args.repo)
 
     if no_llm:
         print("Запросы к модели отключены: печатаю промпты.")
@@ -1537,14 +1586,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         pull_requests: PullRequestClient = NoRemotePullRequests()
         git = NoPushGit(git)
     else:
-        pull_requests = GhPullRequests()
+        pull_requests = GhPullRequests(args.repo)
 
     if args.dry_run:
         # Без этого ветка «переводить нечего» доходит до публикации и создаёт
         # настоящую ветку с коммитом прямо в рабочем каталоге.
         print("Инертный прогон: файлы и локальный репозиторий не меняются.")
         file_system = ReadOnlyFileSystem(file_system)
-        git = ReadOnlyGit(SubprocessGit())
+        git = ReadOnlyGit(SubprocessGit(args.repo))
     print()
 
     pipeline = TranslationPipeline(

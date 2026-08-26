@@ -20,10 +20,12 @@ from mdtranslate.translator import (
     ProviderConfig,
     PromptConfig,
     QuotaExhausted,
+    RealFileSystem,
     ReadOnlyFileSystem,
     ReadOnlyGit,
     RunResult,
     SegmentCodec,
+    SubprocessGit,
     SourceConfig,
     StateConfig,
     TargetConfig,
@@ -605,6 +607,30 @@ class TestIsolationFlags(unittest.TestCase):
         self.assertIsNotNone(git.branch, "локальная ветка создаётся")
         self.assertTrue(git.commits, "локальные коммиты создаются")
         self.assertEqual(git.pushed, [], "но наружу ничего не уходит")
+
+
+class TestRepoRoot(unittest.TestCase):
+    """Пути из конфига относительны корню репозитория, а не текущему каталогу.
+
+    Иначе инструмент можно было бы запускать только изнутри целевого
+    репозитория, и локальная проверка на боевых данных была бы невозможна.
+    """
+
+    def test_relative_paths_are_resolved_against_the_root(self):
+        fs = RealFileSystem("/tmp/some/repo")
+        self.assertEqual(
+            fs.resolve(".github/state.txt"), "/tmp/some/repo/.github/state.txt"
+        )
+
+    def test_absolute_paths_are_left_alone(self):
+        fs = RealFileSystem("/tmp/some/repo")
+        self.assertEqual(fs.resolve("/etc/hosts"), "/etc/hosts")
+
+    def test_default_root_keeps_paths_relative_to_cwd(self):
+        self.assertEqual(RealFileSystem().resolve("a/b.md"), "a/b.md")
+
+    def test_git_commands_carry_the_root(self):
+        self.assertEqual(SubprocessGit("/tmp/repo").root, "/tmp/repo")
 
 
 class TestBatchPlanner(unittest.TestCase):
