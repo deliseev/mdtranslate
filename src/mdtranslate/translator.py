@@ -1220,7 +1220,18 @@ class TranslationPipeline:
         # Вчитываем то, что уже переведено, до планирования: так правки человека
         # становятся эталоном и переиспользуются в других файлах.
         self._ingest(base_doc, translated_doc)
-        return self.merger.plan(path, base_doc, head_doc, translated_doc)
+        plan = self.merger.plan(path, base_doc, head_doc, translated_doc)
+        if plan is None and translated_doc.blocks and not base_doc.blocks:
+            # Сопоставлять не с чем: на базе файла ещё не было, а перевод уже
+            # есть. Само не починится — база в очереди зафиксирована, — поэтому
+            # говорим человеку, что именно от него требуется.
+            print(
+                f"У {path} на базовом коммите нет оригинала, а перевод уже есть: "
+                "похоже, он сделан вручную заранее. Впишите в очередь коммит, "
+                "которому отвечает этот перевод, или удалите перевод, чтобы "
+                "файл перевёлся с нуля."
+            )
+        return plan
 
     def _window(self, anchors: Iterable[int], size: int) -> set[int] | None:
         """Индексы, попадающие в окно вокруг переводимых кусков.
