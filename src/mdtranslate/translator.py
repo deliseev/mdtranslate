@@ -138,6 +138,17 @@ _FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
 _HEADING_RE = re.compile(r"^(#{1,6})\s")
 
 
+# Пустое дерево git. README предлагает его как базу для «перевести файл заново»:
+# от пустого дерева все блоки становятся новыми.
+EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def is_empty_tree(ref: str) -> bool:
+    """Указывает ли база на пустое дерево, то есть на перевод с нуля."""
+    ref = ref.strip().lower()
+    return len(ref) >= 7 and EMPTY_TREE_SHA.startswith(ref)
+
+
 @dataclass(frozen=True)
 class Block:
     """Один блок markdown: текст плюс отделяющие его от следующего пустые строки."""
@@ -1384,7 +1395,13 @@ class TranslationPipeline:
                 print(f"Пропускаю {path}: не удалось надёжно сопоставить перевод.")
                 result.skipped.append(path)
                 continue
-            self._apply_memory(plan)
+            if is_empty_tree(file_base):
+                # Осознанный перевод с нуля. Память вернула бы ровно тот текст,
+                # от которого человек только что избавился, — причём молча и
+                # не потратив ни одного запроса.
+                print(f"{path}: перевод с нуля, память не подставляется.")
+            else:
+                self._apply_memory(plan)
             if not plan.translatable:
                 # Изменились только удаления или блоки кода — переводить нечего.
                 # Публикуем сразу: иначе правка осталась бы только в рабочем

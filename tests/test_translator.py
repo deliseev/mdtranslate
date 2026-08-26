@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 from mdtranslate import translator
 from mdtranslate.translator import (
+    EMPTY_TREE_SHA,
     BatchPlanner,
     BlockAligner,
     Config,
@@ -582,6 +583,45 @@ class TestMemoryInPipeline(unittest.TestCase):
         self.assertIn(".github/tm.jsonl", fs.files, "база записана на диск")
         committed = {p for paths, _ in git.commits for p in paths}
         self.assertIn(".github/tm.jsonl", committed, "база уходит в коммит")
+
+    def test_translating_from_scratch_does_not_come_back_from_memory(self):
+        """Пустое дерево в очереди — осознанное «перевести файл заново».
+
+        Память вернула бы ровно тот текст, от которого человек только что
+        избавился, причём молча и не потратив ни одного запроса, — то есть
+        рецепт из README не делал бы ничего.
+        """
+        pipeline, _, fs, prov = build_pipeline(
+            base_tree={"ch.md": "Known sentence.\n"},
+            head_tree={"ch.md": "Known sentence.\n"},
+            working={},  # перевод удалён руками, как велит рецепт
+            changes=[],  # свежих изменений нет, файл приходит только из очереди
+            config=self._config(),
+        )
+        fs.files[".github/pending.txt"] = f"{EMPTY_TREE_SHA}\tch.md\n"
+        pipeline.memory.add("Known sentence.", "Прежний перевод.")
+
+        result = pipeline.run()
+
+        self.assertEqual(result.translated, ["ch.md"])
+        self.assertEqual(prov.calls, 1, "блок должен уехать модели заново")
+        self.assertEqual(fs.files["ch.md"], "RU(Known sentence.)\n")
+
+    def test_a_new_file_still_gets_its_repeats_from_memory(self):
+        """Дедупликация не должна пострадать: с обычной базой память работает."""
+        pipeline, _, fs, prov = build_pipeline(
+            base_tree={},
+            head_tree={"new.md": "Known sentence.\n"},
+            working={},
+            changes=[("A", "new.md")],
+            config=self._config(),
+        )
+        pipeline.memory.add("Known sentence.", "Известное предложение.")
+
+        pipeline.run()
+
+        self.assertEqual(prov.calls, 0, "повтор берётся из памяти")
+        self.assertIn("Известное предложение.", fs.files["new.md"])
 
     def test_nothing_is_ingested_from_a_poorly_aligned_file(self):
         """При низкой уверенности совпадения прозы позиционные — такие пары
