@@ -1,0 +1,103 @@
+# Пример конфига. Вся специфика проекта живёт здесь — в коде mdtranslate
+# нет ни одного упоминания конкретного репозитория, ветки или языка.
+# Скопируйте файл к себе и поправьте под свой проект.
+
+[source]
+ref = "origin/main"
+include = ["*.md"]
+exclude_paths = [".github", "node_modules"]
+exclude_files = [
+    "readme.md",
+    "gb-readme.md",
+    "license.md",
+    "contributing.md",
+    "code_of_conduct.md",
+    "claude.md",   # служебные документы, а не переводимый контент
+]
+
+[target]
+branch = "ru"
+language = "Russian"
+branch_prefix = "translate/sync-"
+pr_label = "translate"
+pr_title = "🤖 Автоматический перевод обновлений оригинала"
+pr_body_template = """
+Этот PR создан автоматически. Переведены **только изменившиеся куски** текста —
+остальной перевод, включая ручную вычитку, остался нетронутым.
+
+### Переведено
+{translated}
+
+### Пропущено (не удалось безопасно сопоставить блоки — нужен ручной перевод)
+{skipped}
+
+### Отложено до следующего прогона (квота или ошибка провайдера)
+{pending}
+"""
+
+# Оригинал каждого переведённого куска прикладывается к диффу комментарием ревью:
+# иначе в PR виден только результат и сравнивать его не с чем.
+review_comment_template = """**Оригинал:**
+
+{source}"""
+max_review_comments = 300
+
+[state]
+sync_file = ".github/translate-sync-state.txt"
+pending_file = ".github/translate-pending.txt"
+
+[prompt]
+context_mode = "full"
+window_blocks = 20
+max_request_chars = 200000
+template = """
+You are a professional technical translator specialising in Go (Golang) and TDD.
+Translate into {language}.
+
+You are given one or more documents. Inside each document some fragments are
+wrapped in anchors like:
+
+⟦S7⟧
+text to translate
+⟦/S7⟧
+
+Rules:
+1. Translate ONLY the text inside the anchors. Everything else is context —
+   read it to keep terminology and tone consistent, but do not return it.
+2. Return every requested anchor exactly once, keeping the same anchor markers
+   and the same numbers, in the form ⟦S7⟧<translation>⟦/S7⟧.
+3. Return nothing else — no preamble, no explanations, no whole documents.
+4. Keep Markdown syntax intact (headings, lists, emphasis, links).
+5. Never translate or modify code blocks, inline code, identifiers, or function
+   names. Keep link URLs intact; link text may be translated.
+6. Match the terminology and style of the EXISTING TRANSLATION shown for each
+   document — it has been proof-read by a human.
+
+Glossary (use these exact renderings):
+{glossary}
+
+{source}
+"""
+
+# Обязательные соответствия терминов. Отдельной секцией, а не инлайн-таблицей:
+# инлайн-таблица в TOML обязана умещаться в одну строку, а этот список растёт.
+# Секция должна идти после всех ключей [prompt] — иначе template попал бы сюда.
+[prompt.glossary]
+slice = "срез"
+map = "отображение"
+pointer = "указатель"
+mock = "подделка"
+
+# Цепочка: если у провайдера кончилась квота, работа продолжается на следующем.
+[[providers]]
+name = "gemini"
+model = "gemini-2.5-flash"
+api_key_env = "GEMINI_API_KEY"
+
+# Любой OpenAI-совместимый endpoint. Активируется, только когда задан ключ,
+# иначе просто пропускается.
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mdtranslate"
+version = "0.1.0"
+description = "Инкрементальный перевод markdown-документации, не затирающий ручную вычитку"
+readme = "README.md"
+# tomllib появился в stdlib только здесь — внешний парсер TOML не нужен
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+# OpenAI-совместимый провайдер работает на голом urllib, поэтому зависимость
+# нужна только для Gemini.
+gemini = ["google-genai"]
+
+[project.scripts]
+mdtranslate = "mdtranslate.translator:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mdtranslate"]
