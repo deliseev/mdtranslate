@@ -347,9 +347,18 @@ class IncrementalMerger:
                     head_index = j1 + offset
                     target = alignment.mapping.get(base_index)
                     if target is not None and target < len(translated.blocks):
+                        # Текст — из перевода, разделитель — из оригинала:
+                        # структуру документа задаёт голова. У последнего блока
+                        # старого перевода разделитель равен «\n», и, достанься
+                        # он блоку, за которым теперь идёт новый абзац, два
+                        # абзаца склеились бы в один.
                         existing = translated.blocks[target]
                         items.append(
-                            PlanItem(kind="keep", text=existing.text, sep=existing.sep)
+                            PlanItem(
+                                kind="keep",
+                                text=existing.text,
+                                sep=head.blocks[head_index].sep,
+                            )
                         )
                     else:
                         block = head.blocks[head_index]

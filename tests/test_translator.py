@@ -345,6 +345,23 @@ class TestIncrementalMerge(unittest.TestCase):
         committed = {path for paths, _ in git.commits for path in paths}
         self.assertIn("gone.md", committed, "удаление зафиксировано коммитом")
 
+    def test_paragraph_appended_at_the_end_keeps_the_blank_line_before_it(self):
+        """Разделитель берётся из оригинала, а не из старого перевода.
+
+        У последнего блока перевода разделитель равен "\n". Достанься он блоку,
+        за которым теперь идёт новый абзац, оба слиплись бы в один: markdown
+        разделяет абзацы пустой строкой, а не переводом строки.
+        """
+        pipeline, _, fs, _ = build_pipeline(
+            base_tree={"ch.md": "A.\n\nB.\n"},
+            head_tree={"ch.md": "A.\n\nB.\n\nC.\n"},
+            working={"ch.md": "ra.\n\nrb.\n"},
+            changes=[("M", "ch.md")],
+        )
+        pipeline.run()
+
+        self.assertEqual(fs.files["ch.md"], "ra.\n\nrb.\n\nRU(C.)\n")
+
     def test_unalignable_file_stays_queued_until_a_human_repairs_it(self):
         """Файл не выбывает из очереди и сам возвращается в работу после починки.
 
