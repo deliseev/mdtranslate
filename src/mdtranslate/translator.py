@@ -907,11 +907,19 @@ class RunResult:
     skipped: list[str] = field(default_factory=list)
     pending: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
+    quota_exhausted: bool = False
 
     @property
     def needs_attention(self) -> bool:
-        """Остались ли файлы, требующие внимания человека или повтора."""
-        return bool(self.pending or self.skipped)
+        """Требуется ли вмешательство человека.
+
+        Исчерпанная квота — штатный режим: очередь разгребётся сама, когда
+        лимит обновится. Красить такой прогон в красное значит сделать
+        настоящую аварию неотличимой от обычного дня.
+        """
+        if self.skipped:
+            return True
+        return bool(self.pending) and not self.quota_exhausted
 
 
 class FileFilter:
@@ -1314,6 +1322,7 @@ class TranslationPipeline:
             except QuotaExhausted as exc:
                 print(f"Квота исчерпана, остальное откладываю: {exc}")
                 quota_spent = True
+                result.quota_exhausted = True
                 self._defer(pending, batch_plans, plan_bases)
                 continue
             except ProviderError as exc:
@@ -1478,6 +1487,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"  нужен ручной перевод (не сопоставилось): {path}")
     for path in result.pending:
         print(f"  отложено до следующего прогона: {path}")
+    if result.quota_exhausted:
+        print(
+            "Квота провайдера исчерпана — это штатный режим: очередь "
+            "разгребётся, когда лимит обновится."
+        )
 
     if args.dry_run:
         return 0

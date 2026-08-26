@@ -16,6 +16,7 @@ from mdtranslate.translator import (
     ProviderConfig,
     PromptConfig,
     QuotaExhausted,
+    RunResult,
     SegmentCodec,
     SourceConfig,
     StateConfig,
@@ -526,6 +527,25 @@ class TestMemoryInPipeline(unittest.TestCase):
         )
         pipeline.run()
         self.assertEqual(len(pipeline.memory), 0)
+
+
+class TestExitSignal(unittest.TestCase):
+    """Исчерпанная квота — штатный режим, а не авария.
+
+    Если красить такой прогон в красное, настоящая поломка перестаёт
+    отличаться от обычного дня, когда лимит просто кончился.
+    """
+
+    def test_quota_deferral_alone_is_not_a_failure(self):
+        result = RunResult(translated=["a.md"], pending=["b.md"], quota_exhausted=True)
+        self.assertFalse(result.needs_attention)
+
+    def test_deferral_without_quota_is_a_failure(self):
+        self.assertTrue(RunResult(pending=["b.md"]).needs_attention)
+
+    def test_file_needing_a_human_is_always_a_failure(self):
+        result = RunResult(skipped=["c.md"], quota_exhausted=True)
+        self.assertTrue(result.needs_attention)
 
 
 class TestBatchPlanner(unittest.TestCase):
