@@ -325,6 +325,26 @@ class TestIncrementalMerge(unittest.TestCase):
             "ch.md", committed, "a file with nothing to translate must still be committed"
         )
 
+    def test_file_deleted_upstream_is_committed_not_just_unlinked(self):
+        """Удаление обязано попасть в коммит, а не остаться в рабочем дереве.
+
+        Маркер синхронизации уходит на head первым же коммитом, в следующий
+        дифф файл уже не попадёт, и незакоммиченное удаление сгинуло бы вместе
+        с рабочим деревом раннера — перевод остался бы в ветке навсегда.
+        """
+        pipeline, git, fs, _ = build_pipeline(
+            base_tree={"gone.md": "A.\n"},
+            head_tree={},
+            working={"gone.md": "ra.\n"},
+            changes=[("D", "gone.md")],
+        )
+        result = pipeline.run()
+
+        self.assertEqual(result.removed, ["gone.md"])
+        self.assertNotIn("gone.md", fs.files, "перевод удалён с диска")
+        committed = {path for paths, _ in git.commits for path in paths}
+        self.assertIn("gone.md", committed, "удаление зафиксировано коммитом")
+
     def test_unalignable_file_stays_queued_until_a_human_repairs_it(self):
         """Файл не выбывает из очереди и сам возвращается в работу после починки.
 

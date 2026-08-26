@@ -1348,6 +1348,21 @@ class TranslationPipeline:
         for path, file_base in candidates:
             pending.setdefault(path, file_base)
 
+        if result.removed:
+            # Удаление тоже надо зафиксировать, и обязательно после того, как
+            # очередь пополнена: маркер уходит на head первым же коммитом, в
+            # следующий дифф удалённый файл не попадёт, и незакоммиченное
+            # удаление сгинуло бы вместе с рабочим деревом раннера.
+            self._publish(
+                [*result.removed, *self._state_paths(head, pending)],
+                "docs: удаление "
+                + (
+                    result.removed[0]
+                    if len(result.removed) == 1
+                    else f"{len(result.removed)} файлов"
+                ),
+            )
+
         plans: list[FilePlan] = []
         plan_bases: dict[str, str] = {}
         for path, file_base in candidates:
