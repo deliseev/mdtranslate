@@ -6,6 +6,7 @@ import argparse
 import dataclasses
 import difflib
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -67,6 +68,24 @@ class PromptConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    """Память переводов: где лежит и насколько придирчива.
+
+    Пустой `file` полностью выключает память — инструмент ведёт себя как раньше.
+    """
+
+    file: str = ""
+    fuzzy_threshold: float = 0.8
+    min_length_ratio: float = 0.4
+    max_length_ratio: float = 2.6
+
+    @property
+    def enabled(self) -> bool:
+        """Включена ли память."""
+        return bool(self.file)
+
+
+@dataclass(frozen=True)
 class ProviderConfig:
     """Описание одного провайдера перевода."""
 
@@ -85,6 +104,7 @@ class Config:
     state: StateConfig
     prompt: PromptConfig
     providers: list[ProviderConfig]
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
     def replace(self, **changes: Any) -> "Config":
         """Возвращает копию конфига с изменёнными полями."""
@@ -109,6 +129,7 @@ def load_config(path: str) -> Config:
             max_request_chars=int(prompt.get("max_request_chars", 200_000)),
         ),
         providers=[ProviderConfig(**p) for p in raw.get("providers", [])],
+        memory=MemoryConfig(**raw.get("memory", {})),
     )
 
 
@@ -270,6 +291,9 @@ class PlanItem:
     text: str
     sep: str
     source_index: int = -1
+    # Похожая пара из памяти: модель чинит старый перевод вместо перевода с нуля,
+    # поэтому ручная вычитка остальной части блока переживает правку оригинала.
+    hint: "MemoryEntry | None" = None
 
 
 @dataclass
@@ -390,6 +414,100 @@ class BatchPlanner:
         if current:
             batches.append(current)
         return batches
+
+
+@dataclass(frozen=True)
+class MemoryEntry:
+    """Пара «оригинал — перевод» из памяти переводов."""
+
+    source: str
+    translation: str
+
+
+class TranslationMemory:
+    """База переводов, ключ — хеш исходного текста.
+
+    Неверная пара тут хуже отсутствующей: она подставится молча и навсегда,
+    поэтому запись строже чтения. Отношение длин перевода к оригиналу
+    проверяется по границам, замеренным на реальном корпусе.
+    """
+
+    def __init__(
+        self,
+        entries: dict[str, MemoryEntry] | None = None,
+        min_length_ratio: float = 0.4,
+        max_length_ratio: float = 2.6,
+    ) -> None:
+        self._entries: dict[str, MemoryEntry] = dict(entries or {})
+        self.min_length_ratio = min_length_ratio
+        self.max_length_ratio = max_length_ratio
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    @staticmethod
+    def key(source: str) -> str:
+        """Ключ записи — усечённый sha256 исходного текста."""
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+
+    def lookup(self, source: str) -> str | None:
+        """Готовый перевод для точно такого же исходного текста."""
+        entry = self._entries.get(self.key(source))
+        return entry.translation if entry else None
+
+    def add(self, source: str, translation: str) -> bool:
+        """Запоминает пару. Возвращает False, если пара отвергнута как негодная."""
+        if not source.strip() or not translation.strip():
+            return False
+        ratio = len(translation) / len(source)
+        if not self.min_length_ratio <= ratio <= self.max_length_ratio:
+            return False
+        self._entries[self.key(source)] = MemoryEntry(source, translation)
+        return True
+
+    def nearest(self, source: str, cutoff: float) -> MemoryEntry | None:
+        """Самая похожая запись, если сходство не ниже порога.
+
+        Отбор по длине идёт первым: он отбрасывает подавляющее большинство
+        кандидатов, не запуская дорогое посимвольное сравнение.
+        """
+        best: MemoryEntry | None = None
+        best_ratio = cutoff
+        for entry in self._entries.values():
+            longest = max(len(entry.source), len(source))
+            if not longest or abs(len(entry.source) - len(source)) / longest > 1 - cutoff:
+                continue
+            ratio = difflib.SequenceMatcher(None, source, entry.source).ratio()
+            if ratio >= best_ratio:
+                best, best_ratio = entry, ratio
+        return best
+
+    @classmethod
+    def load(cls, fs: "FileSystem", path: str, **limits: float) -> "TranslationMemory":
+        """Читает базу из JSONL; отсутствие файла — это просто пустая база."""
+        memory = cls(**limits)
+        if not fs.exists(path):
+            return memory
+        for line in fs.read(path).splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                memory._entries[row["h"]] = MemoryEntry(row["s"], row["t"])
+            except (ValueError, KeyError):
+                print(f"Пропускаю битую строку в {path}: {line[:60]!r}")
+        return memory
+
+    def save(self, fs: "FileSystem", path: str) -> None:
+        """Пишет базу построчно и с сортировкой — чтобы диффы были минимальными."""
+        lines = [
+            json.dumps(
+                {"h": key, "s": entry.source, "t": entry.translation},
+                ensure_ascii=False,
+            )
+            for key, entry in sorted(self._entries.items())
+        ]
+        fs.write(path, "\n".join(lines) + ("\n" if lines else ""))
 
 
 class QuotaExhausted(Exception):
@@ -838,8 +956,73 @@ class TranslationPipeline:
         self.merger = merger or IncrementalMerger(BlockAligner())
         self.codec = codec or SegmentCodec()
         self.file_filter = FileFilter(config.source)
+        self.memory = TranslationMemory.load(
+            fs,
+            config.memory.file,
+            min_length_ratio=config.memory.min_length_ratio,
+            max_length_ratio=config.memory.max_length_ratio,
+        ) if config.memory.enabled else TranslationMemory()
         self._branch: str | None = None
         self._pr_number: int | None = None
+
+    def _remember(self, source: str, translation: str) -> None:
+        """Кладёт пару в память, если она включена."""
+        if self.config.memory.enabled:
+            self.memory.add(source, translation)
+
+    def _apply_memory(self, plan: FilePlan) -> None:
+        """Закрывает памятью то, что можно, остальному подбирает похожие пары.
+
+        Точное совпадение снимает блок с перевода совсем. Похожее не
+        подставляется молча — оно уходит модели как задание на минимальную
+        правку, чтобы вычитанный человеком текст не переписывался заново.
+        """
+        if not self.config.memory.enabled:
+            return
+        reused = repairs = 0
+        for item in plan.items:
+            if item.kind != "translate":
+                continue
+            exact = self.memory.lookup(item.text)
+            if exact is not None:
+                item.kind, item.text = "keep", exact
+                reused += 1
+                continue
+            near = self.memory.nearest(item.text, self.config.memory.fuzzy_threshold)
+            if near is not None:
+                item.hint = near
+                repairs += 1
+        if reused or repairs:
+            print(
+                f"{plan.path}: из памяти взято {reused}, на починку помечено {repairs}."
+            )
+
+    def _ingest(self, base: Document, translated: Document) -> None:
+        """Забирает в память пары из уже переведённого файла.
+
+        Только уверенное выравнивание: у прозы сигнатура всегда ("para",),
+        поэтому при низкой уверенности совпадения внутри длинного прогона
+        абзацев позиционные, и один пропущенный абзац сдвинул бы все
+        последующие — в память попали бы неверные пары.
+        """
+        if not self.config.memory.enabled or not translated.blocks:
+            return
+        alignment = self.merger.aligner.align(base.blocks, translated.blocks)
+        if not alignment.confident:
+            return
+        for source_index, target_index in alignment.mapping.items():
+            block = base.blocks[source_index]
+            if block.is_code or target_index >= len(translated.blocks):
+                continue
+            self._remember(block.text, translated.blocks[target_index].text)
+
+    def _state_paths(self, head: str, pending: dict[str, str]) -> list[str]:
+        """Файлы состояния для коммита, включая память, если она включена."""
+        paths = self._write_state(head, pending)
+        if self.config.memory.enabled:
+            self.memory.save(self.fs, self.config.memory.file)
+            paths.append(self.config.memory.file)
+        return paths
 
     def _read_pending(self) -> dict[str, str]:
         """Отложенные файлы вида «путь -> коммит, которому отвечает их перевод».
@@ -899,6 +1082,9 @@ class TranslationPipeline:
         head_doc = self.splitter.split(head_text)
         existing = self.fs.read(path) if self.fs.exists(path) else ""
         translated_doc = self.splitter.split(existing)
+        # Вчитываем то, что уже переведено, до планирования: так правки человека
+        # становятся эталоном и переиспользуются в других файлах.
+        self._ingest(base_doc, translated_doc)
         return self.merger.plan(path, base_doc, head_doc, translated_doc)
 
     def _window(self, anchors: Iterable[int], size: int) -> set[int] | None:
@@ -949,10 +1135,21 @@ class TranslationPipeline:
         glossary = "\n".join(
             f"{k} -> {v}" for k, v in (self.config.prompt.glossary or {}).items()
         )
+        # Задания на починку: у сегмента есть почти такой же прежний оригинал и
+        # его перевод. Просим внести минимальную правку, а не переводить заново,
+        # чтобы вычитанный человеком текст уцелел.
+        repairs = "\n".join(
+            f"Segment {segment_id}:\n"
+            f"PREVIOUS SOURCE:\n{item.hint.source}\n"
+            f"PREVIOUS TRANSLATION:\n{item.hint.translation}\n"
+            for segment_id, item in sorted(ids.items())
+            if item.hint is not None
+        )
         return self.config.prompt.template.format(
             language=self.config.target.language,
             glossary=glossary,
             source="\n".join(sections),
+            repairs=repairs or "(none)",
             existing_translation="",
         )
 
@@ -1069,6 +1266,7 @@ class TranslationPipeline:
                 print(f"Пропускаю {path}: не удалось надёжно сопоставить перевод.")
                 result.skipped.append(path)
                 continue
+            self._apply_memory(plan)
             if not plan.translatable:
                 # Изменились только удаления или блоки кода — переводить нечего.
                 # Публикуем сразу: иначе правка осталась бы только в рабочем
@@ -1080,7 +1278,7 @@ class TranslationPipeline:
                 result.translated.append(path)
                 pending.pop(path, None)
                 self._publish(
-                    [path, *self._write_state(head, pending)],
+                    [path, *self._state_paths(head, pending)],
                     f"docs: обновление {path} без перевода",
                 )
                 continue
@@ -1150,17 +1348,18 @@ class TranslationPipeline:
                                 ),
                             )
                         )
+                        self._remember(item.text, received[segment_id])
                         rendered += received[segment_id] + item.sep
                 self.fs.write(plan.path, rendered)
                 result.translated.append(plan.path)
                 pending.pop(plan.path, None)
                 self._publish(
-                    [plan.path, *self._write_state(head, pending)],
+                    [plan.path, *self._state_paths(head, pending)],
                     f"docs: перевод {plan.path}",
                 )
 
         result.pending = sorted(pending)
-        state_paths = self._write_state(head, pending)
+        state_paths = self._state_paths(head, pending)
         if self._branch is not None:
             self._publish(state_paths, "docs: обновление состояния перевода")
             if self._pr_number:

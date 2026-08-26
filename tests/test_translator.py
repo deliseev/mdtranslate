@@ -12,6 +12,7 @@ from mdtranslate.translator import (
     BlockAligner,
     Config,
     MarkdownSplitter,
+    MemoryConfig,
     ProviderConfig,
     PromptConfig,
     QuotaExhausted,
@@ -20,6 +21,7 @@ from mdtranslate.translator import (
     StateConfig,
     TargetConfig,
     TranslationPipeline,
+    TranslationMemory,
     TranslationRequest,
     chain_translate,
 )
@@ -86,11 +88,13 @@ class FakeProvider:
         self.codec = codec
         self.calls = 0
         self.translated_sources = []
+        self.prompts = []
         self._fail_with = fail_with
         self._drop = set(drop_segments)
 
     def translate(self, request):
         self.calls += 1
+        self.prompts.append(request.prompt)
         if self._fail_with is not None:
             raise self._fail_with
         parts = []
@@ -154,7 +158,7 @@ def make_config(**overrides):
             sync_file=".github/sync.txt", pending_file=".github/pending.txt"
         ),
         prompt=PromptConfig(
-            template="{language}\n{glossary}\n{source}\n{existing_translation}",
+            template="{language}\n{glossary}\n{source}\nREPAIRS:\n{repairs}",
             glossary={},
             context_mode="full",
             window_blocks=20,
@@ -425,6 +429,103 @@ class TestResilience(unittest.TestCase):
                 [a.translate, b.translate],
                 TranslationRequest(prompt="p", segments={1: "s"}),
             )
+
+
+class TestTranslationMemory(unittest.TestCase):
+    def test_pair_with_wild_length_ratio_is_rejected(self):
+        """Неверная пара хуже отсутствующей: она подставится молча и навсегда."""
+        memory = TranslationMemory()
+        self.assertTrue(memory.add("A normal sentence.", "Обычное предложение."))
+        self.assertFalse(memory.add("short", "x" * 500), "перевод неправдоподобно длинный")
+        self.assertFalse(memory.add("x" * 500, "short"), "перевод неправдоподобно короткий")
+        self.assertFalse(memory.add("  ", "непустой"), "пустой оригинал")
+        self.assertEqual(len(memory), 1)
+
+    def test_round_trip_through_jsonl(self):
+        memory = TranslationMemory()
+        memory.add("Hello there.", "Здравствуйте.")
+        fs = FakeFS()
+        memory.save(fs, "tm.jsonl")
+        restored = TranslationMemory.load(fs, "tm.jsonl")
+        self.assertEqual(restored.lookup("Hello there."), "Здравствуйте.")
+        self.assertEqual(len(restored), 1)
+
+    def test_nearest_respects_the_threshold(self):
+        memory = TranslationMemory()
+        memory.add("The quick brown fox jumps over the dog.", "Быстрая лиса прыгает.")
+        near = memory.nearest("The quick brown fox jumps over the cat.", 0.8)
+        self.assertIsNotNone(near)
+        self.assertEqual(near.translation, "Быстрая лиса прыгает.")
+        self.assertIsNone(memory.nearest("Completely unrelated wording here.", 0.8))
+
+
+class TestMemoryInPipeline(unittest.TestCase):
+    def _config(self):
+        return make_config().replace(memory=MemoryConfig(file=".github/tm.jsonl"))
+
+    def test_exact_hit_costs_no_request(self):
+        pipeline, _, fs, prov = build_pipeline(
+            base_tree={"ch.md": "A.\n"},
+            head_tree={"ch.md": "A.\n\nKnown sentence.\n"},
+            working={"ch.md": "ra.\n"},
+            changes=[("M", "ch.md")],
+            config=self._config(),
+        )
+        pipeline.memory.add("Known sentence.", "Известное предложение.")
+
+        result = pipeline.run()
+
+        self.assertEqual(result.translated, ["ch.md"])
+        self.assertEqual(prov.calls, 0, "перевод должен прийти из памяти")
+        self.assertIn("Известное предложение.", fs.files["ch.md"])
+
+    def test_similar_block_goes_to_the_model_with_its_previous_translation(self):
+        """Похожее не подставляется молча — модель чинит старый перевод."""
+        old = "The quick brown fox jumps over the lazy dog."
+        new = "The quick brown fox jumps over the lazy cat."
+        pipeline, _, _, prov = build_pipeline(
+            base_tree={"ch.md": "A.\n"},
+            head_tree={"ch.md": f"A.\n\n{new}\n"},
+            working={"ch.md": "ra.\n"},
+            changes=[("M", "ch.md")],
+            config=self._config(),
+        )
+        pipeline.memory.add(old, "Быстрая лиса прыгает через ленивого пса.")
+
+        pipeline.run()
+
+        self.assertEqual(prov.calls, 1, "блок всё же переводится")
+        prompt = prov.prompts[0]
+        self.assertIn("Быстрая лиса прыгает через ленивого пса.", prompt)
+        self.assertIn(old, prompt, "в промпте есть прежний оригинал")
+
+    def test_translations_are_remembered_and_committed(self):
+        pipeline, git, fs, _ = build_pipeline(
+            base_tree={"ch.md": "A.\n"},
+            head_tree={"ch.md": "A.\n\nFresh text.\n"},
+            working={"ch.md": "ra.\n"},
+            changes=[("M", "ch.md")],
+            config=self._config(),
+        )
+        pipeline.run()
+
+        self.assertEqual(pipeline.memory.lookup("Fresh text."), "RU(Fresh text.)")
+        self.assertIn(".github/tm.jsonl", fs.files, "база записана на диск")
+        committed = {p for paths, _ in git.commits for p in paths}
+        self.assertIn(".github/tm.jsonl", committed, "база уходит в коммит")
+
+    def test_nothing_is_ingested_from_a_poorly_aligned_file(self):
+        """При низкой уверенности совпадения прозы позиционные — такие пары
+        отравили бы базу навсегда."""
+        pipeline, _, _, _ = build_pipeline(
+            base_tree={"ch.md": "one.\n\ntwo.\n\nthree.\n\nfour.\n\nfive.\n"},
+            head_tree={"ch.md": "one X.\n\ntwo.\n\nthree.\n\nfour.\n\nfive.\n"},
+            working={"ch.md": "only.\n\ntwo.\n"},
+            changes=[("M", "ch.md")],
+            config=self._config(),
+        )
+        pipeline.run()
+        self.assertEqual(len(pipeline.memory), 0)
 
 
 class TestBatchPlanner(unittest.TestCase):

@@ -76,6 +76,14 @@ Rules:
 Glossary (use these exact renderings):
 {glossary}
 
+Some segments have a nearly identical earlier version listed under REPAIRS.
+For those, do NOT translate from scratch: take the previous translation and change
+only what the change in the source requires, leaving the rest of the wording exactly
+as it was. That wording may have been proof-read by a human.
+
+REPAIRS:
+{repairs}
+
 {source}
 """
 
@@ -87,6 +95,16 @@ slice = "срез"
 map = "отображение"
 pointer = "указатель"
 mock = "подделка"
+
+# Память переводов. Пустой file (или отсутствие секции) полностью её выключает.
+[memory]
+file = ".github/translate-memory.jsonl"
+# Порог схожести, ниже которого прежний перевод не предлагается на починку.
+fuzzy_threshold = 0.8
+# Границы отношения длин перевода к оригиналу: пара вне них в базу не попадает.
+# Замерено на реальном корпусе: 1-й перцентиль 0.81, 99-й 1.45.
+min_length_ratio = 0.4
+max_length_ratio = 2.6
 
 # Цепочка: если у провайдера кончилась квота, работа продолжается на следующем.
 [[providers]]
