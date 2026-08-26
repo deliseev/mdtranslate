@@ -760,7 +760,10 @@ class SubprocessGit:
         """
         self._run("add", "--", *paths)
         staged = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
+            # -C обязателен: без него проверка смотрит в репозиторий текущего
+            # каталога, и с --repo каждый коммит молча превращался в «нечего
+            # коммитить» — работа оставалась незакоммиченной.
+            ["git", "-C", self.root, "diff", "--cached", "--quiet"],
             timeout=GIT_TIMEOUT_SECONDS,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

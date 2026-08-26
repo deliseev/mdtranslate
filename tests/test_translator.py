@@ -7,8 +7,11 @@ call signatures, mock assertions do not.
 
 import contextlib
 import io
+import subprocess
 import unittest
+from types import SimpleNamespace
 
+from mdtranslate import translator
 from mdtranslate.translator import (
     BatchPlanner,
     BlockAligner,
@@ -114,6 +117,25 @@ class FakeProvider:
             self.translated_sources.append(source)
             parts.append(self.codec.wrap(seg_id, f"RU({source})"))
         return "\n".join(parts)
+
+
+class FakeSubprocess:
+    """Stands in for the subprocess module so that git argv can be inspected."""
+
+    DEVNULL = subprocess.DEVNULL
+    CalledProcessError = subprocess.CalledProcessError
+
+    def __init__(self, staged_returncode=1):
+        self.argv = []
+        self._staged = staged_returncode
+
+    def check_output(self, args, **kwargs):
+        self.argv.append(list(args))
+        return ""
+
+    def run(self, args, **kwargs):
+        self.argv.append(list(args))
+        return SimpleNamespace(returncode=self._staged)
 
 
 class FakePRClient:
@@ -631,6 +653,41 @@ class TestRepoRoot(unittest.TestCase):
 
     def test_git_commands_carry_the_root(self):
         self.assertEqual(SubprocessGit("/tmp/repo").root, "/tmp/repo")
+
+    def _patched_git(self, staged_returncode=1):
+        """SubprocessGit поверх фейкового subprocess: видно каждый argv."""
+        fake = FakeSubprocess(staged_returncode)
+        original = translator.subprocess
+        translator.subprocess = fake
+        self.addCleanup(setattr, translator, "subprocess", original)
+        return SubprocessGit("/tmp/repo"), fake
+
+    def test_every_git_command_carries_the_root(self):
+        """Проверка индекса тоже. Без -C она смотрела в репозиторий текущего
+        каталога, и с --repo каждый коммит молча превращался в «нечего
+        коммитить»: работа оставалась незакоммиченной, а прогон рапортовал
+        об успехе."""
+        git, fake = self._patched_git(staged_returncode=1)  # в индексе есть что
+
+        git.commit(["ch.md"], "docs: перевод ch.md")
+
+        self.assertTrue(fake.argv)
+        for argv in fake.argv:
+            self.assertEqual(argv[:3], ["git", "-C", "/tmp/repo"], argv)
+        self.assertIn(
+            ["git", "-C", "/tmp/repo", "commit", "-m", "docs: перевод ch.md"],
+            fake.argv,
+            "коммит должен состояться",
+        )
+
+    def test_clean_index_is_not_committed(self):
+        """Пустой коммит git отвергает кодом 1 — это уронило бы весь прогон."""
+        git, fake = self._patched_git(staged_returncode=0)  # различий нет
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            git.commit(["ch.md"], "docs: перевод ch.md")
+
+        self.assertNotIn("commit", [argv[3] for argv in fake.argv])
 
 
 class TestBatchPlanner(unittest.TestCase):
