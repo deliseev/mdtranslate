@@ -794,7 +794,56 @@ class RealFileSystem:
             os.remove(path)
 
 
-class DryRunFileSystem:
+class NoPushGit:
+    """Пропускает локальные операции, но не выпускает изменения наружу."""
+
+    def __init__(self, inner: GitClient) -> None:
+        self._inner = inner
+
+    def rev_parse(self, ref: str) -> str:
+        """Разрешает ссылку в хеш коммита."""
+        return self._inner.rev_parse(ref)
+
+    def show(self, ref: str, path: str) -> str:
+        """Читает содержимое файла на указанной ревизии."""
+        return self._inner.show(ref, path)
+
+    def diff_name_status(
+        self, base: str, head: str, patterns: Sequence[str]
+    ) -> list[tuple[str, str]]:
+        """Возвращает пары (статус, путь) для изменившихся файлов."""
+        return self._inner.diff_name_status(base, head, patterns)
+
+    def create_branch(self, name: str) -> None:
+        """Создаёт ветку: операция локальная, наружу ничего не уходит."""
+        self._inner.create_branch(name)
+
+    def commit(self, paths: Sequence[str], message: str) -> None:
+        """Коммитит: операция локальная, наружу ничего не уходит."""
+        self._inner.commit(paths, message)
+
+    def push(self, branch: str) -> None:
+        """Сообщает о пуше, не выполняя его."""
+        print(f"[--no-remote] не отправляю ветку {branch}")
+
+
+class ReadOnlyGit(NoPushGit):
+    """Дополнительно запрещает менять и локальный репозиторий.
+
+    Нужен для полностью инертного прогона: без этого ветка «переводить нечего»
+    доходит до публикации и создаёт настоящую ветку прямо в рабочем каталоге.
+    """
+
+    def create_branch(self, name: str) -> None:
+        """Сообщает о создании ветки, не создавая её."""
+        print(f"[--dry-run] создал бы ветку {name}")
+
+    def commit(self, paths: Sequence[str], message: str) -> None:
+        """Сообщает о коммите, не создавая его."""
+        print(f"[--dry-run] закоммитил бы {len(paths)} файл(ов): {message}")
+
+
+class ReadOnlyFileSystem:
     """Читает по-настоящему, но записи и удаления только печатает."""
 
     def __init__(self, inner: FileSystem) -> None:
@@ -806,7 +855,7 @@ class DryRunFileSystem:
 
     def write(self, path: str, text: str) -> None:
         """Сообщает о записи, не трогая диск."""
-        print(f"[dry-run] записал бы {path} ({len(text)} символов)")
+        print(f"[--dry-run] записал бы {path} ({len(text)} символов)")
 
     def exists(self, path: str) -> bool:
         """Существует ли файл."""
@@ -814,7 +863,7 @@ class DryRunFileSystem:
 
     def remove(self, path: str) -> None:
         """Сообщает об удалении, не трогая диск."""
-        print(f"[dry-run] удалил бы {path}")
+        print(f"[--dry-run] удалил бы {path}")
 
 
 class GhPullRequests:
@@ -1400,29 +1449,29 @@ class TranslationPipeline:
         )
 
 
-class DryRunPullRequests:
+class NoRemotePullRequests:
     """PullRequestClient, который ничего не создаёт, а только печатает."""
 
     def create_draft(
         self, branch: str, base: str, title: str, body: str, label: str
     ) -> int:
         """Сообщает, какой PR был бы открыт."""
-        print(f"[dry-run] открыл бы черновой PR из {branch} в {base}")
+        print(f"[--no-remote] открыл бы черновой PR из {branch} в {base}")
         return 0
 
     def mark_ready(self, number: int) -> None:
         """Сообщает о переводе PR в готовый."""
-        print(f"[dry-run] пометил бы PR #{number} готовым")
+        print(f"[--no-remote] пометил бы PR #{number} готовым")
 
     def update_body(self, number: int, body: str) -> None:
         """Сообщает об обновлении описания."""
-        print(f"[dry-run] обновил бы описание PR #{number}")
+        print(f"[--no-remote] обновил бы описание PR #{number}")
 
     def add_review(
         self, number: int, commit_id: str, comments: Sequence[ReviewComment]
     ) -> None:
         """Сообщает, сколько оригиналов было бы приложено к диффу."""
-        print(f"[dry-run] приложил бы к PR #{number} оригиналов: {len(comments)}")
+        print(f"[--no-remote] приложил бы к PR #{number} оригиналов: {len(comments)}")
         for c in comments[:3]:
             print(f"   {c.path}:{c.line} — {c.body.splitlines()[-1][:70]!r}")
 
@@ -1450,28 +1499,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="путь к TOML-конфигу",
     )
     parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="не обращаться к модели: печатать промпт вместо запроса. "
+        "Ключи API при этом не нужны",
+    )
+    parser.add_argument(
+        "--no-remote",
+        action="store_true",
+        help="ничего не отправлять наружу: без push и без операций с pull request. "
+        "Локальные ветки и коммиты создаются",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="не обращаться к ИИ и ничего не менять: только печатать промпты",
+        help="полностью инертный прогон: включает --no-llm и --no-remote и вдобавок "
+        "не трогает ни файлы, ни локальный репозиторий",
     )
     args = parser.parse_args(argv)
 
+    no_llm = args.no_llm or args.dry_run
+    no_remote = args.no_remote or args.dry_run
+
     config = load_config(args.config)
     file_system: FileSystem = RealFileSystem()
+    git: GitClient = SubprocessGit()
 
-    if args.dry_run:
-        print("Режим dry-run: запросы к ИИ не отправляются, файлы не меняются.\n")
+    if no_llm:
+        print("Запросы к модели отключены: печатаю промпты.")
         translate: Callable[[TranslationRequest], str] = print_request
-        file_system = DryRunFileSystem(file_system)
-        pull_requests: PullRequestClient = DryRunPullRequests()
     else:
         translators = build_translators(config)
         translate = lambda request: chain_translate(translators, request)  # noqa: E731
+
+    if no_remote:
+        print("Отправка наружу отключена: без push и без pull request.")
+        pull_requests: PullRequestClient = NoRemotePullRequests()
+        git = NoPushGit(git)
+    else:
         pull_requests = GhPullRequests()
+
+    if args.dry_run:
+        # Без этого ветка «переводить нечего» доходит до публикации и создаёт
+        # настоящую ветку с коммитом прямо в рабочем каталоге.
+        print("Инертный прогон: файлы и локальный репозиторий не меняются.")
+        file_system = ReadOnlyFileSystem(file_system)
+        git = ReadOnlyGit(SubprocessGit())
+    print()
 
     pipeline = TranslationPipeline(
         config=config,
-        git=SubprocessGit(),
+        git=git,
         fs=file_system,
         translate=translate,
         pull_requests=pull_requests,
@@ -1493,7 +1571,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "разгребётся, когда лимит обновится."
         )
 
-    if args.dry_run:
+    if no_llm:
+        # Без обращений к модели переводить нечем, поэтому «отложено» здесь
+        # ничего не означает и сигналом о проблеме быть не может.
         return 0
     return 1 if result.needs_attention else 0
 

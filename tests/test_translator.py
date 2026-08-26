@@ -5,6 +5,8 @@ Hand-written fakes instead of unittest.mock — fakes survive refactoring of
 call signatures, mock assertions do not.
 """
 
+import contextlib
+import io
 import unittest
 
 from mdtranslate.translator import (
@@ -12,10 +14,14 @@ from mdtranslate.translator import (
     BlockAligner,
     Config,
     MarkdownSplitter,
+    NoPushGit,
+    NoRemotePullRequests,
     MemoryConfig,
     ProviderConfig,
     PromptConfig,
     QuotaExhausted,
+    ReadOnlyFileSystem,
+    ReadOnlyGit,
     RunResult,
     SegmentCodec,
     SourceConfig,
@@ -25,6 +31,7 @@ from mdtranslate.translator import (
     TranslationMemory,
     TranslationRequest,
     chain_translate,
+    print_request,
 )
 
 # --------------------------------------------------------------------------
@@ -546,6 +553,58 @@ class TestExitSignal(unittest.TestCase):
     def test_file_needing_a_human_is_always_a_failure(self):
         result = RunResult(skipped=["c.md"], quota_exhausted=True)
         self.assertTrue(result.needs_attention)
+
+
+class TestIsolationFlags(unittest.TestCase):
+    """Разделённые режимы изоляции.
+
+    Раньше единственный --dry-run не защищал git: ветка «переводить нечего»
+    доходила до публикации и создавала настоящую ветку с пушем.
+    """
+
+    def _wired(self, git):
+        return TranslationPipeline(
+            config=make_config(),
+            git=git,
+            fs=ReadOnlyFileSystem(
+                FakeFS(
+                    {
+                        "ch.md": "ra.\n\nrb.\n\nrc.\n",
+                        ".github/sync.txt": "aaaaaaa1111111",
+                    }
+                )
+            ),
+            translate=print_request,
+            pull_requests=NoRemotePullRequests(),
+            clock=FakeClock(),
+        )
+
+    def _fake_git(self):
+        return FakeGit(
+            head="bbbbbbb2222222",
+            # блок удалён в голове -> «переводить нечего» -> путь до публикации
+            trees={
+                "origin/main": {"ch.md": "A.\n\nB.\n"},
+                "aaaaaaa1111111": {"ch.md": "A.\n\nB.\n\nC.\n"},
+            },
+            changes=[("M", "ch.md")],
+        )
+
+    def test_read_only_git_touches_nothing(self):
+        git = self._fake_git()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self._wired(ReadOnlyGit(git)).run()
+        self.assertIsNone(git.branch, "ветка не создаётся")
+        self.assertEqual(git.commits, [], "коммитов нет")
+        self.assertEqual(git.pushed, [], "пушей нет")
+
+    def test_no_push_git_keeps_work_local(self):
+        git = self._fake_git()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self._wired(NoPushGit(git)).run()
+        self.assertIsNotNone(git.branch, "локальная ветка создаётся")
+        self.assertTrue(git.commits, "локальные коммиты создаются")
+        self.assertEqual(git.pushed, [], "но наружу ничего не уходит")
 
 
 class TestBatchPlanner(unittest.TestCase):
