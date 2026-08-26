@@ -111,12 +111,33 @@ class Config:
         return dataclasses.replace(self, **changes)
 
 
+_ANCHOR_RE = re.compile(r"⟦S(\d+)⟧")
+
+
+def decoy_anchor_ids(template: str) -> set[int]:
+    """Номера якорей, встречающиеся в самом шаблоне промпта.
+
+    Настоящие сегменты нумеруются с единицы и живут в {source}, поэтому любой
+    такой номер в тексте инструкции — пример. Модель может вернуть его эхом, и
+    при совпадении с номером живого сегмента текст примера молча уедет в
+    документ вместо перевода.
+    """
+    return {int(number) for number in _ANCHOR_RE.findall(template) if int(number) >= 1}
+
+
 def load_config(path: str) -> Config:
     """Читает TOML-конфиг и разбирает его в типизированные объекты."""
     with open(path, "rb") as handle:
         raw = tomllib.load(handle)
 
     prompt = raw.get("prompt", {})
+    decoys = decoy_anchor_ids(prompt.get("template", ""))
+    if decoys:
+        print(
+            f"Внимание: в шаблоне промпта есть якоря-примеры {sorted(decoys)}. "
+            "Сегменты нумеруются с единицы, поэтому такой номер однажды "
+            "совпадёт с живым; возьмите для примера ⟦S0⟧."
+        )
     return Config(
         source=SourceConfig(**raw["source"]),
         target=TargetConfig(**raw["target"]),

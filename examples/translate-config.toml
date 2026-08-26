@@ -57,15 +57,17 @@ Translate into {language}.
 You are given one or more documents. Inside each document some fragments are
 wrapped in anchors like:
 
-⟦S7⟧
+⟦S0⟧
 text to translate
-⟦/S7⟧
+⟦/S0⟧
 
 Rules:
 1. Translate ONLY the text inside the anchors. Everything else is context —
    read it to keep terminology and tone consistent, but do not return it.
 2. Return every requested anchor exactly once, keeping the same anchor markers
-   and the same numbers, in the form ⟦S7⟧<translation>⟦/S7⟧.
+   and the same numbers, in the form ⟦Sn⟧<translation>⟦/Sn⟧ with the same n.
+   The S0 above is only an illustration: that number is never issued, so it
+   must never appear in your answer.
 3. Return nothing else — no preamble, no explanations, no whole documents.
 4. Keep Markdown syntax intact (headings, lists, emphasis, links).
 5. Never translate or modify code blocks, inline code, identifiers, or function

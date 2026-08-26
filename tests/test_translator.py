@@ -7,6 +7,7 @@ call signatures, mock assertions do not.
 
 import contextlib
 import io
+import pathlib
 import subprocess
 import unittest
 from types import SimpleNamespace
@@ -37,6 +38,7 @@ from mdtranslate.translator import (
     TranslationMemory,
     TranslationRequest,
     chain_translate,
+    decoy_anchor_ids,
     print_request,
 )
 
@@ -765,6 +767,26 @@ class TestRepoRoot(unittest.TestCase):
             git.commit(["ch.md"], "docs: перевод ch.md")
 
         self.assertNotIn("commit", [argv[3] for argv in fake.argv])
+
+
+class TestPromptTemplate(unittest.TestCase):
+    """Якорь-пример в инструкции не должен совпадать с живым номером.
+
+    Сегменты нумеруются с единицы, поэтому пример вида ⟦S7⟧ однажды совпадёт
+    с настоящим сегментом. Верни модель этот пример эхом — и «text to
+    translate» молча уедет в документ вместо перевода.
+    """
+
+    def test_example_anchor_that_could_collide_is_reported(self):
+        self.assertEqual(decoy_anchor_ids("wrapped like ⟦S7⟧text⟦/S7⟧ here"), {7})
+
+    def test_zero_never_collides_because_numbering_starts_at_one(self):
+        self.assertEqual(decoy_anchor_ids("wrapped like ⟦S0⟧text⟦/S0⟧ here"), set())
+
+    def test_shipped_example_config_is_clean(self):
+        config = pathlib.Path(__file__).resolve().parents[1] / "examples"
+        template = (config / "translate-config.toml").read_text(encoding="utf-8")
+        self.assertEqual(decoy_anchor_ids(template), set())
 
 
 class TestBatchPlanner(unittest.TestCase):
