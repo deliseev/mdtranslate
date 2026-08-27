@@ -54,6 +54,12 @@ class StateConfig:
 
     sync_file: str
     pending_file: str
+    # Удалять ли перевод, когда оригинал удалён в апстриме. По умолчанию нет:
+    # если ветка перевода синхронизируется мержем, удаление приходит туда
+    # конфликтом modify/delete, и решение «выбросить готовый перевод» принимает
+    # человек. Инструмент, стирающий файл следом, молча переигрывал бы это
+    # решение. Включай осознанно — там, где ветка обновляется не мержем.
+    delete_removed: bool = False
 
 
 @dataclass(frozen=True)
@@ -700,7 +706,7 @@ class GitClient(Protocol):
     def show(self, ref: str, path: str) -> str: ...
     def diff_name_status(
         self, base: str, head: str, patterns: Sequence[str]
-    ) -> list[tuple[str, str]]: ...
+    ) -> list[tuple[str, str, str]]: ...
     def create_branch(self, name: str) -> None: ...
     def commit(self, paths: Sequence[str], message: str) -> None: ...
     def push(self, branch: str) -> None: ...
@@ -776,16 +782,31 @@ class SubprocessGit:
 
     def diff_name_status(
         self, base: str, head: str, patterns: Sequence[str]
-    ) -> list[tuple[str, str]]:
-        """Возвращает пары (статус, путь) для изменившихся файлов."""
+    ) -> list[tuple[str, str, str]]:
+        """Возвращает тройки (статус, путь, путь на базе).
+
+        У обычного изменения оба пути совпадают. Переименование git отдаёт
+        строкой `R096\told.md\tnew.md`, и старый путь здесь принципиален:
+        на базовом коммите файла с новым именем не существует, сравнивать
+        новый оригинал не с чем.
+
+        `R` обязан быть в фильтре. Без него переименование не попадает в дифф
+        вообще — ни `D` на старом пути, ни `A` на новом, — и правка, приехавшая
+        вместе с переименованием, молча остаётся непереведённой навсегда.
+        """
         output = self._run(
-            "diff", "--name-status", "--diff-filter=AMD", base, head, "--", *patterns
+            "diff", "--name-status", "--diff-filter=AMDR", base, head, "--", *patterns
         )
-        rows: list[tuple[str, str]] = []
+        rows: list[tuple[str, str, str]] = []
         for line in output.splitlines():
-            if "\t" in line:
-                status, path = line.split("\t", 1)
-                rows.append((status[:1], path))
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            status = fields[0][:1]
+            if status == "R" and len(fields) >= 3:
+                rows.append((status, fields[2], fields[1]))
+            else:
+                rows.append((status, fields[1], fields[1]))
         return rows
 
     def create_branch(self, name: str) -> None:
@@ -880,8 +901,8 @@ class NoPushGit:
 
     def diff_name_status(
         self, base: str, head: str, patterns: Sequence[str]
-    ) -> list[tuple[str, str]]:
-        """Возвращает пары (статус, путь) для изменившихся файлов."""
+    ) -> list[tuple[str, str, str]]:
+        """Возвращает тройки (статус, путь, путь на базе)."""
         return self._inner.diff_name_status(base, head, patterns)
 
     def create_branch(self, name: str) -> None:
@@ -1209,11 +1230,16 @@ class TranslationPipeline:
         except FileNotFoundError:
             return ""
 
-    def _build_plan(self, path: str, base_ref: str) -> FilePlan | None:
+    def _build_plan(
+        self, path: str, base_ref: str, base_path: str | None = None
+    ) -> FilePlan | None:
+        # base_path отличается от path только у переименованного файла: новый
+        # оригинал лежит под новым именем, а прежний — под старым.
+        base_path = base_path or path
         head_text = self._show(self.config.source.ref, path)
         if not head_text:
             return None
-        base_doc = self.splitter.split(self._show(base_ref, path))
+        base_doc = self.splitter.split(self._show(base_ref, base_path))
         head_doc = self.splitter.split(head_text)
         existing = self.fs.read(path) if self.fs.exists(path) else ""
         translated_doc = self.splitter.split(existing)
@@ -1358,16 +1384,31 @@ class TranslationPipeline:
         )
 
         # Каждый кандидат несёт свою базу: для свежих изменений это общий маркер,
-        # а для отложенных — коммит, которому отвечает их текущий перевод.
-        candidates: list[tuple[str, str]] = []
-        for status, path in changed:
+        # а для отложенных — коммит, которому отвечает их текущий перевод. Третий
+        # элемент — имя файла на этой базе; отличается только у переименований.
+        candidates: list[tuple[str, str, str]] = []
+        for status, path, base_path in changed:
             if not self.file_filter.accepts(path):
                 continue
             if status == "D":
+                if not self.config.state.delete_removed:
+                    # Перевод не наш, чтобы его выбрасывать: при синхронизации
+                    # мержем удаление приходит конфликтом modify/delete, и что
+                    # с ним делать, уже решил человек. См. StateConfig.
+                    print(
+                        f"{path} удалён в оригинале — перевод оставлен на месте "
+                        "(state.delete_removed = false)."
+                    )
+                    continue
                 self.fs.remove(path)
                 pending.pop(path, None)
                 result.removed.append(path)
             else:
+                if status == "R" and base_path in pending:
+                    # Очередь помнит файл под старым именем. Не перенеси мы
+                    # запись, она осталась бы висеть на несуществующем пути и
+                    # застряла бы там навсегда.
+                    pending[path] = pending.pop(base_path)
                 # Файл мог одновременно измениться и ждать в очереди. Тогда
                 # верна база из очереди: она старше маркера, и перевод отвечает
                 # именно ей. Взяв маркер, мы пропустили бы всё, что накопилось
@@ -1375,8 +1416,8 @@ class TranslationPipeline:
                 queued = pending.get(path)
                 if queued is not None and not queued:
                     continue  # база не указана — разберём ниже, вместе с человеком
-                candidates.append((path, queued or base_ref))
-        fresh = {path for path, _ in candidates}
+                candidates.append((path, queued or base_ref, base_path))
+        fresh = {path for path, _, _ in candidates}
         for path in sorted(set(pending) - fresh):
             # Правила исключений действуют и на очередь: иначе однажды
             # застрявший файл переводился бы вопреки изменившемуся конфигу.
@@ -1391,13 +1432,13 @@ class TranslationPipeline:
                 )
                 result.skipped.append(path)
                 continue
-            candidates.append((path, pending[path]))
+            candidates.append((path, pending[path], path))
 
         # Пока файл не обработан, он числится отложенным. Маркер синхронизации
         # уходит на head уже на первом коммите, поэтому оборванный прогон иначе
         # оставил бы состояние «всё готово» для файлов, до которых не дошёл, —
         # и их изменения пропали бы навсегда.
-        for path, file_base in candidates:
+        for path, file_base, _ in candidates:
             pending.setdefault(path, file_base)
 
         if result.removed:
@@ -1417,8 +1458,8 @@ class TranslationPipeline:
 
         plans: list[FilePlan] = []
         plan_bases: dict[str, str] = {}
-        for path, file_base in candidates:
-            plan = self._build_plan(path, file_base)
+        for path, file_base, base_path in candidates:
+            plan = self._build_plan(path, file_base, base_path)
             if plan is None:
                 # Из очереди не убираем: маркер уйдёт вперёд, и файл больше
                 # ничем не всплывёт. Перепроверка стоит ноль обращений к API —
