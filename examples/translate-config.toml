@@ -45,6 +45,10 @@ max_review_comments = 300
 [state]
 sync_file = ".github/translate-sync-state.txt"
 pending_file = ".github/translate-pending.txt"
+# Удалять ли перевод, когда оригинал удалён. По умолчанию false: если ветка
+# перевода синхронизируется мержем, удаление приходит туда конфликтом
+# modify/delete и решение принимает человек.
+# delete_removed = false
 
 [prompt]
 context_mode = "full"

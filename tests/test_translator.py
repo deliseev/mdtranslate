@@ -68,7 +68,12 @@ class FakeGit:
             raise FileNotFoundError(f"{ref}:{path}")
 
     def diff_name_status(self, base, head, patterns):
-        return list(self._changes)
+        # Тесты задают изменения парами (статус, путь); настоящий git отдаёт
+        # ещё и имя файла на базе, которое отличается только у переименований.
+        return [
+            row if len(row) == 3 else (row[0], row[1], row[1])
+            for row in self._changes
+        ]
 
     def create_branch(self, name):
         self.branch = name
@@ -334,12 +339,22 @@ class TestIncrementalMerge(unittest.TestCase):
         Маркер синхронизации уходит на head первым же коммитом, в следующий
         дифф файл уже не попадёт, и незакоммиченное удаление сгинуло бы вместе
         с рабочим деревом раннера — перевод остался бы в ветке навсегда.
+
+        Речь про режим, включённый явно: по умолчанию перевод не удаляется,
+        см. соседний тест.
         """
         pipeline, git, fs, _ = build_pipeline(
             base_tree={"gone.md": "A.\n"},
             head_tree={},
             working={"gone.md": "ra.\n"},
             changes=[("D", "gone.md")],
+            config=make_config(
+                state=StateConfig(
+                    sync_file=".github/sync.txt",
+                    pending_file=".github/pending.txt",
+                    delete_removed=True,
+                )
+            ),
         )
         result = pipeline.run()
 
@@ -797,6 +812,104 @@ class TestBatchPlanner(unittest.TestCase):
         grouped = [[path for path, _ in batch] for batch in batches]
         self.assertIn(["a.md", "b.md", "c.md"], grouped)
         self.assertIn(["big.md"], grouped)
+
+
+class TestRenamesAndDeletions(unittest.TestCase):
+    """Что делает инструмент, когда глава переехала или исчезла."""
+
+    def test_diff_filter_includes_renames(self):
+        """Без `R` в фильтре переименование не видно вообще.
+
+        Ни `D` на старом пути, ни `A` на новом: git отдаёт одну строку `R`,
+        и она отсеивается. Файл при этом остаётся под старым именем навсегда,
+        а маркер уезжает вперёд — вернуть его в работу уже нечему.
+        """
+        seen = []
+
+        def fake_run(*args, **kwargs):
+            seen.extend(args)
+            return ""
+
+        git = SubprocessGit()
+        git._run = fake_run
+        git.diff_name_status("base", "head", ["*.md"])
+        self.assertIn("--diff-filter=AMDR", seen)
+
+    def test_rename_row_carries_both_paths(self):
+        git = SubprocessGit()
+        git._run = lambda *a, **k: (
+            "M\tkept.md\n" "R096\told.md\tnew.md\n" "D\tgone.md\n"
+        )
+        self.assertEqual(
+            git.diff_name_status("base", "head", ["*.md"]),
+            [
+                ("M", "kept.md", "kept.md"),
+                ("R", "new.md", "old.md"),
+                ("D", "gone.md", "gone.md"),
+            ],
+        )
+
+    def test_renamed_chapter_is_diffed_against_its_old_name(self):
+        """Переименование плюс правка: переводится только правка.
+
+        Оригинал на базе лежит под старым именем, поэтому сравнивать новый
+        текст надо именно с ним. Возьми мы новое имя — на базе его нет, файл
+        выглядел бы новым и переводился бы целиком, затирая ручную вычитку.
+        """
+        pipeline, _, fs, prov = build_pipeline(
+            base_tree={"old.md": "A para.\n\nB para.\n\nC para.\n"},
+            head_tree={"new.md": "A para.\n\nB para CHANGED.\n\nC para.\n"},
+            working={"new.md": "Перевод A.\n\nПеревод B.\n\nПеревод C.\n"},
+            changes=[("R", "new.md", "old.md")],
+        )
+        result = pipeline.run()
+
+        self.assertEqual(result.translated, ["new.md"])
+        self.assertEqual(prov.translated_sources, ["B para CHANGED."])
+        out = fs.files["new.md"]
+        self.assertIn("Перевод A.", out)
+        self.assertIn("RU(B para CHANGED.)", out)
+        self.assertIn("Перевод C.", out)
+
+    def test_rename_moves_the_queue_entry_to_the_new_name(self):
+        """Запись в очереди переезжает вместе с файлом.
+
+        Иначе она осталась бы висеть на имени, которого больше нет: файл по
+        нему не читается, каждый прогон честно докладывает о пропуске, и запись
+        не уходит из очереди никогда.
+        """
+        pipeline, _, _, _ = build_pipeline(
+            base_tree={"old.md": "A para.\n\nB para.\n"},
+            head_tree={"new.md": "A para.\n\nB para CHANGED.\n"},
+            working={
+                "new.md": "Перевод A.\n\nПеревод B.\n",
+                ".github/pending.txt": "aaaaaaa1111111\told.md\n",
+            },
+            changes=[("R", "new.md", "old.md")],
+        )
+        result = pipeline.run()
+
+        self.assertEqual(result.translated, ["new.md"])
+        self.assertEqual(result.skipped, [], "старое имя не осталось висеть в очереди")
+
+    def test_deleted_upstream_keeps_the_translation_by_default(self):
+        """Готовый перевод инструмент сам не выбрасывает.
+
+        Когда ветка перевода синхронизируется мержем, удаление приходит туда
+        конфликтом modify/delete, и решение принимает человек. Инструмент,
+        стирающий файл следом, молча переиграл бы это решение.
+        """
+        pipeline, _, fs, _ = build_pipeline(
+            base_tree={"gone.md": "A.\n"},
+            head_tree={},
+            working={"gone.md": "ra.\n"},
+            changes=[("D", "gone.md")],
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = pipeline.run()
+
+        self.assertEqual(result.removed, [])
+        self.assertIn("gone.md", fs.files, "перевод остался на месте")
 
 
 if __name__ == "__main__":

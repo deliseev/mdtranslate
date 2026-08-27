@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mdtranslate"
-version = "0.1.0"
+version = "0.3.0"
 description = "Инкрементальный перевод markdown-документации, не затирающий ручную вычитку"
 readme = "README.md"
 # tomllib появился в stdlib только здесь — внешний парсер TOML не нужен
